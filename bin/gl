@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Работа с GitLab из claude.ai/code: клон, ветка, MR — через git + REST API.
+# Нужны переменные окружения: GITLAB_TOKEN (обязательно), GITLAB_HOST (по умолчанию gitlab.com).
+# Токен нигде не записывается на диск: git получает его через credential helper из переменной.
+set -euo pipefail
+
+HOST="${GITLAB_HOST:-gitlab.com}"
+API="${GITLAB_API:-https://$HOST/api/v4}"  # GITLAB_API переопределяется только в тестах
+WORK="${GL_WORKDIR:-$HOME/gitlab}"
+
+die() { echo "gl: $*" >&2; exit 1; }
+need_token() { [ -n "${GITLAB_TOKEN:-}" ] || die "GITLAB_TOKEN не задан — добавь его в переменные окружения claude.ai/code"; }
+urlenc() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+
+# GET/POST к API: gl api <path> [json-body]
+api() {
+  need_token
+  local path="$1" body="${2:-}"
+  if [ -n "$body" ]; then
+    curl -fsS --max-time 60 -H "PRIVATE-TOKEN: $GITLAB_TOKEN" -H "Content-Type: application/json" -X POST -d "$body" "$API/$path"
+  else
+    curl -fsS --max-time 60 -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/$path"
+  fi
+}
+
+# git с токеном из переменной, без записи в .git/config
+git_auth() {
+  git -c credential.helper= \
+      -c "credential.helper=!f() { echo username=oauth2; echo \"password=\$GITLAB_TOKEN\"; }; f" "$@"
+}
+
+# Путь проекта (group/sub/project) из origin текущего репозитория
+project_path() {
+  git remote get-url origin | sed -E "s#^https://[^/]+/##; s#\.git\$##"
+}
+
+cmd_clone() {
+  need_token
+  local path="${1:?использование: gl clone <group/project>}"
+  local dest="$WORK/${path##*/}"
+  mkdir -p "$WORK"
+  if [ -d "$dest/.git" ]; then
+    echo "уже склонирован: $dest — обновляю"
+    git_auth -C "$dest" fetch -q origin
+  else
+    git_auth clone -q "https://$HOST/$path.git" "$dest"
+  fi
+  echo "$dest"
+}
+
+cmd_mr() {
+  need_token
+  local title="${1:?использование: gl mr \"Заголовок\" [описание] [целевая-ветка]}"
+  local desc="${2:-}" target="${3:-}"
+  local branch project id
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  project="$(project_path)"
+  id="$(urlenc "$project")"
+
+  local default
+  default="$(api "projects/$id" | python3 -c 'import sys, json; print(json.load(sys.stdin)["default_branch"])')"
+  target="${target:-$default}"
+  [ "$branch" != "$default" ] || die "ты на ветке по умолчанию ($default) — создай отдельную: git checkout -b fix/<что-то>"
+
+  git_auth push -q -u origin "$branch"
+
+  local body
+  body="$(python3 -c 'import json, sys; print(json.dumps({"source_branch": sys.argv[1], "target_branch": sys.argv[2], "title": sys.argv[3], "description": sys.argv[4], "remove_source_branch": True}))' \
+    "$branch" "$target" "$title" "$desc")"
+  api "projects/$id/merge_requests" "$body" | python3 -c 'import sys, json; mr = json.load(sys.stdin); print("MR !%s: %s" % (mr["iid"], mr["web_url"]))'
+}
+
+case "${1:-}" in
+  clone) shift; cmd_clone "$@" ;;
+  mr)    shift; cmd_mr "$@" ;;
+  api)   shift; api "$@"; echo ;;
+  push)  shift; git_auth push "$@" ;;
+  fetch) shift; git_auth fetch "$@" ;;
+  *) cat <<'EOF'
+gl clone <group/project>            склонировать проект из GitLab в ~/gitlab/<project>
+gl mr "Заголовок" [описание] [ветка] запушить текущую ветку и открыть MR (по умолчанию в ветку по умолчанию)
+gl api <path> [json]                запрос к GitLab API, например: gl api "projects/<id>/pipelines?per_page=5"
+gl push|fetch [...]                 git push/fetch с токеном
+EOF
+  ;;
+esac
