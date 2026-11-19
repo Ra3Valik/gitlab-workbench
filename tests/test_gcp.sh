@@ -3,7 +3,7 @@
 set -e
 cd "$(dirname "$0")/.."
 T="$(mktemp -d)"; trap 'kill $MOCK 2>/dev/null; rm -rf "$T"' EXIT
-python3 -m py_compile bin/gcp && echo "syntax ok"
+python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' bin/gcp && echo "syntax ok"
 
 cat > "$T/mock.py" <<'PY'
 import json, http.server, urllib.parse, sys
