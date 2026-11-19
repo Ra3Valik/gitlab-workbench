@@ -35,6 +35,11 @@ claude.ai/code → выбрать репозиторий `gitlab-workbench` → 
 gcloud auth application-default login
 base64 -w0 ~/.config/gcloud/application_default_credentials.json   # macOS: base64 -i <файл>
 ```
+Windows (PowerShell; gcloud ставится `winget install Google.CloudSDK`, потом открыть новое окно PowerShell):
+```powershell
+gcloud auth application-default login
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("$env:APPDATA\gcloud\application_default_credentials.json")) | Set-Clipboard
+```
 Вывод положить в переменные окружения claude.ai/code:
 - `GCP_ADC_B64` = строка base64 (в чат её не вставлять);
 - `GCP_PROJECT` = проект по умолчанию (например `mawari-chain-staging-493218`), необязательно.
