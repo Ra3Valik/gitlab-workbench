@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Google Cloud из claude.ai/code ТОЛЬКО на чтение: логи (Cloud Logging) и SELECT в Cloud SQL (PostgreSQL).
+
+Авторизация — Google-аккаунт пользователя: переменная окружения GCP_ADC_B64 = base64 от файла
+application_default_credentials.json (см. README). Токен живёт только в памяти процесса:
+на диск не пишется, в вывод не попадает.
+
+Записи в GCP скрипт не умеет в принципе: в нём нет команд, меняющих ресурсы.
+SQL выполняется внутри BEGIN READ ONLY ... ROLLBACK, допускается один оператор
+SELECT / WITH / EXPLAIN / SHOW / TABLE / VALUES.
+"""
+import base64
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+OAUTH = os.environ.get("GCP_OAUTH_URL", "https://oauth2.googleapis.com")
+LOGGING = os.environ.get("GCP_LOGGING_API", "https://logging.googleapis.com/v2")
+SQLADMIN = os.environ.get("GCP_SQLADMIN_API", "https://sqladmin.googleapis.com/v1")
+CRM = os.environ.get("GCP_CRM_API", "https://cloudresourcemanager.googleapis.com/v1")
+
+USAGE = """\
+gcp whoami                                     какой аккаунт и какие scope у токена
+gcp projects                                   доступные проекты GCP
+gcp logs [-p PROJECT] [-n 50] [--since 1h] [FILTER]
+                                               логи Cloud Logging, новые сверху; FILTER — синтаксис Logging,
+                                               напр. 'resource.type="cloud_run_revision" severity>=ERROR'
+gcp sql-instances [-p PROJECT]                 инстансы Cloud SQL
+gcp sql-dbs [-p PROJECT] INSTANCE              базы в инстансе
+gcp sql [-p PROJECT] [-n 100] [--json] INSTANCE DATABASE "SELECT ..."
+                                               запрос только на чтение
+
+PROJECT по умолчанию — из GCP_PROJECT.
+Пользователь БД: по умолчанию IAM-пользователь твоего аккаунта (autoIamAuthn);
+если заданы GCP_SQL_USER и GCP_SQL_PASSWORD_SECRET (projects/../secrets/../versions/..),
+то этот пользователь — например, отдельная read-only роль.
+"""
+
+READONLY_START = re.compile(r"^\s*(select|with|explain|show|table|values)\b", re.I)
+
+
+def die(msg, code=1):
+    print(f"gcp: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def http(method, url, body=None, token=None, form=None):
+    headers = {}
+    data = None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read())
+            err = err.get("error_description") or err.get("error", {}).get("message") or err.get("error") or err
+        except Exception:
+            err = e.reason
+        die(f"{method} {url.split('?')[0]} -> HTTP {e.code}: {err}")
+    except urllib.error.URLError as e:
+        die(f"{method} {url.split('?')[0]} -> {e.reason}")
+
+
+_token = None
+
+
+def token():
+    """Access token из refresh token пользователя. Только в памяти."""
+    global _token
+    if _token:
+        return _token
+    raw = os.environ.get("GCP_ADC_B64", "").strip()
+    if not raw:
+        die("GCP_ADC_B64 не задан — добавь его в переменные окружения claude.ai/code (см. README)")
+    try:
+        cred = json.loads(base64.b64decode(raw))
+    except Exception:
+        die("GCP_ADC_B64 не похож на base64 от application_default_credentials.json")
+    if cred.get("type") != "authorized_user":
+        die(f"ожидались учётные данные пользователя (type=authorized_user), а не {cred.get('type')!r}")
+    resp = http("POST", f"{OAUTH}/token", form={
+        "grant_type": "refresh_token",
+        "client_id": cred["client_id"],
+        "client_secret": cred["client_secret"],
+        "refresh_token": cred["refresh_token"],
+    })
+    _token = resp["access_token"]
+    return _token
+
+
+def get(url):
+    return http("GET", url, token=token())
+
+
+def take(args, flag, default=None):
+    """Вынуть из args значение флага (-p X / --since X)."""
+    names = flag if isinstance(flag, tuple) else (flag,)
+    for n in names:
+        if n in args:
+            i = args.index(n)
+            if i + 1 >= len(args):
+                die(f"{n}: нужно значение")
+            val = args[i + 1]
+            del args[i:i + 2]
+            return val
+    return default
+
+
+def project_of(args):
+    p = take(args, ("-p", "--project"), os.environ.get("GCP_PROJECT"))
+    if not p:
+        die("не указан проект: -p PROJECT или GCP_PROJECT")
+    return p
+
+
+def cmd_whoami(args):
+    info = http("GET", f"{OAUTH}/tokeninfo?" + urllib.parse.urlencode({"access_token": token()}))
+    print("account:", info.get("email", "?"))
+    print("scopes: ", info.get("scope", "?"))
+    print("expires in:", info.get("expires_in", "?"), "s")
+
+
+def cmd_projects(args):
+    url = f"{CRM}/projects?pageSize=200"
+    for p in get(url).get("projects", []):
+        if p.get("lifecycleState") == "ACTIVE":
+            print(p["projectId"], "\t", p.get("name", ""))
+
+
+SINCE = re.compile(r"^(\d+)([smhd])$")
+
+
+def cmd_logs(args):
+    project = project_of(args)
+    limit = int(take(args, ("-n", "--limit"), "50"))
+    since = take(args, "--since", "1h")
+    flt = " ".join(args).strip()
+    m = SINCE.match(since)
+    if not m:
+        die("--since: формат 30m / 2h / 1d")
+    from datetime import datetime, timedelta, timezone
+    sec = int(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]]
+    ts = (datetime.now(timezone.utc) - timedelta(seconds=sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    full = f'timestamp>="{ts}"' + (f" AND ({flt})" if flt else "")
+    # entries:list — метод чтения (POST только из-за формы запроса)
+    resp = http("POST", f"{LOGGING}/entries:list", token=token(), body={
+        "resourceNames": [f"projects/{project}"],
+        "filter": full,
+        "orderBy": "timestamp desc",
+        "pageSize": min(limit, 1000),
+    })
+    entries = resp.get("entries", [])
+    for e in entries:
+        res = e.get("resource", {})
+        labels = res.get("labels", {})
+        where = labels.get("service_name") or labels.get("instance_id") or labels.get("database_id") or ""
+        if "textPayload" in e:
+            text = e["textPayload"]
+        elif "jsonPayload" in e:
+            jp = e["jsonPayload"]
+            text = jp.get("message") or jp.get("msg") or json.dumps(jp, ensure_ascii=False)
+        elif "protoPayload" in e:
+            pp = e["protoPayload"]
+            text = f"{pp.get('methodName', '')} {pp.get('resourceName', '')} {pp.get('status', {}).get('message', '')}".strip()
+        else:
+            text = ""
+        if "httpRequest" in e:
+            hr = e["httpRequest"]
+            text = f"{hr.get('requestMethod', '')} {hr.get('status', '')} {hr.get('requestUrl', '')} {text}".strip()
+        print(f"{e.get('timestamp', '')[:23]} {e.get('severity', 'DEFAULT'):<8} {res.get('type', '')}/{where}  {text}")
+    if not entries:
+        print(f"(пусто: {full})", file=sys.stderr)
+
+
+def cmd_sql_instances(args):
+    project = project_of(args)
+    for i in get(f"{SQLADMIN}/projects/{project}/instances").get("items", []):
+        s = i.get("settings", {})
+        iam = any(f.get("name") == "cloudsql.iam_authentication" and f.get("value") == "on"
+                  for f in s.get("databaseFlags", []))
+        print(i["name"], i.get("databaseVersion", ""), i.get("region", ""), i.get("state", ""),
+              f"iam_auth={'on' if iam else 'off'}", f"data_api={s.get('dataApiAccess', '?')}", sep="\t")
+
+
+def cmd_sql_dbs(args):
+    project = project_of(args)
+    if len(args) != 1:
+        die("использование: gcp sql-dbs [-p PROJECT] INSTANCE")
+    for d in get(f"{SQLADMIN}/projects/{project}/instances/{args[0]}/databases").get("items", []):
+        print(d["name"])
+
+
+def readonly_statement(sql):
+    """Один оператор только на чтение, иначе — отказ."""
+    s = sql.strip().rstrip(";").strip()
+    if not s:
+        die("пустой запрос")
+    if ";" in s:
+        die("только один оператор и без ';' внутри (в т.ч. в строках) — так READ ONLY нельзя обойти")
+    if not READONLY_START.match(s):
+        die("разрешены только SELECT / WITH / EXPLAIN / SHOW / TABLE / VALUES")
+    if re.search(r"\bexplain\b[^;]*\banalyze\b", s, re.I):
+        die("EXPLAIN ANALYZE выполняет запрос — используй просто EXPLAIN")
+    return s
+
+
+def cmd_sql(args):
+    project = project_of(args)
+    limit = take(args, ("-n", "--limit"), "100")
+    as_json = "--json" in args
+    if as_json:
+        args.remove("--json")
+    if len(args) != 3:
+        die('использование: gcp sql [-p PROJECT] [-n 100] [--json] INSTANCE DATABASE "SELECT ..."')
+    instance, database, sql = args
+    stmt = readonly_statement(sql)
+    body = {
+        "database": database,
+        # транзакция только на чтение: Postgres сам отклонит любую запись
+        "sqlStatement": f"BEGIN TRANSACTION READ ONLY; {stmt}; ROLLBACK;",
+        "rowLimit": str(int(limit)),
+        "partialResultMode": "ALLOW_PARTIAL_RESULT",
+        "application": "claude-workbench",
+    }
+    user, secret = os.environ.get("GCP_SQL_USER"), os.environ.get("GCP_SQL_PASSWORD_SECRET")
+    if user and secret:
+        body.update(user=user, passwordSecretVersion=secret)
+    else:
+        body["autoIamAuthn"] = True
+    resp = http("POST", f"{SQLADMIN}/projects/{project}/instances/{instance}/executeSql", token=token(), body=body)
+    for m in resp.get("messages", []):
+        print(f"[{m.get('severity', '')}] {m.get('message', '')}", file=sys.stderr)
+    st = resp.get("status") or {}
+    if st.get("message"):
+        die(f"ошибка БД: {st['message']}")
+    # результат нашего запроса — тот, у которого есть колонки
+    res = next((r for r in resp.get("results", []) if r.get("columns")), None)
+    if res is None:
+        msgs = [r.get("message") for r in resp.get("results", []) if r.get("message")]
+        print("\n".join(msgs) or "(нет результата)")
+        return
+    cols = [c["name"] for c in res["columns"]]
+    rows = [[None if v.get("nullValue") else v.get("value") for v in r.get("values", [])] for r in res.get("rows", [])]
+    if as_json:
+        print(json.dumps([dict(zip(cols, r)) for r in rows], ensure_ascii=False, indent=1))
+    else:
+        print("\t".join(cols))
+        for r in rows:
+            print("\t".join("NULL" if v is None else str(v).replace("\n", "\\n").replace("\t", "\\t") for v in r))
+    print(f"({len(rows)} строк{', результат обрезан' if res.get('partialResult') else ''})", file=sys.stderr)
+
+
+COMMANDS = {
+    "whoami": cmd_whoami,
+    "projects": cmd_projects,
+    "logs": cmd_logs,
+    "sql-instances": cmd_sql_instances,
+    "sql-dbs": cmd_sql_dbs,
+    "sql": cmd_sql,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(USAGE, end="")
+        sys.exit(0 if len(sys.argv) < 2 else 1)
+    COMMANDS[sys.argv[1]](sys.argv[2:])
